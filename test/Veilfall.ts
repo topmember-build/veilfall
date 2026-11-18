@@ -48,23 +48,37 @@ describe("Veilfall", function () {
     return roles;
   }
 
-  async function night(id: number, kill: number, save: number, roles: number[]) {
+  async function forceAfterTimeout(id: number) {
+    await ethers.provider.send("evm_increaseTime", [10 * 60 + 5]);
+    await ethers.provider.send("evm_mine", []);
+    await (await game.forceResolve(id)).wait();
+  }
+
+  async function night(
+    id: number,
+    kill: number,
+    save: number,
+    roles: number[],
+    opts: { skip?: number[]; force?: boolean } = {},
+  ) {
     const info = await game.gameInfo(id);
     for (let i = 0; i < 5; i++) {
-      if (!info.alive[i]) continue;
+      if (!info.alive[i] || opts.skip?.includes(i)) continue;
       // Villagers submit decoys; the contract must ignore them.
       const target = roles[i] === KILLER ? kill : roles[i] === DOCTOR ? save : (i + 1) % 5;
       const enc = await fhevm.createEncryptedInput(gameAddress, players[i].address).add8(target).encrypt();
       await (await game.connect(players[i]).submitNightAction(id, enc.handles[0], enc.inputProof)).wait();
     }
+    if (opts.force) await forceAfterTimeout(id);
     await reveal(id, "night");
   }
 
-  async function vote(id: number, votes: Record<number, number>) {
+  async function vote(id: number, votes: Record<number, number>, force = false) {
     for (const [voter, target] of Object.entries(votes)) {
       const enc = await fhevm.createEncryptedInput(gameAddress, players[+voter].address).add8(target).encrypt();
       await (await game.connect(players[+voter]).submitVote(id, enc.handles[0], enc.inputProof)).wait();
     }
+    if (force) await forceAfterTimeout(id);
     await reveal(id, "day");
   }
 
@@ -221,6 +235,90 @@ describe("Veilfall", function () {
     const info = await game.gameInfo(id);
     expect(Number(info.lastDeadSeat)).to.eq(0);
     expect(info.alive[0]).to.eq(false);
+  });
+
+  // ------------------------------------------------------- stall protection
+
+  async function gameWithVillagerAtSeat0(): Promise<{ id: number; roles: number[] }> {
+    for (let attempt = 0; attempt < 15; attempt++) {
+      const id = await startGame();
+      const roles = await allRoles(id);
+      if (roles[0] === VILLAGER) return { id, roles };
+    }
+    throw new Error("could not get a Villager at seat 0");
+  }
+
+  it("stall: a Killer who never acts kills nobody (seat 0 is not killed by default)", async function () {
+    const { id, roles } = await gameWithVillagerAtSeat0();
+    const k = pick(roles, KILLER);
+    // The Doctor protects seat 1, so a default kill of seat 0 would NOT be masked by a save.
+    await night(id, 0, 1, roles, { skip: [k], force: true });
+    const info = await game.gameInfo(id);
+    expect(Number(info.lastDeadSeat)).to.eq(NOBODY);
+    expect(info.alive.every((a: boolean) => a)).to.eq(true);
+    expect(Number(info.phase)).to.eq(Phase.Day);
+  });
+
+  it("stall: a Doctor who never acts saves nobody (seat 0 is not saved by default)", async function () {
+    const { id, roles } = await gameWithVillagerAtSeat0();
+    const d = pick(roles, DOCTOR);
+    await night(id, 0, 0, roles, { skip: [d], force: true });
+    const info = await game.gameInfo(id);
+    expect(Number(info.lastDeadSeat)).to.eq(0);
+    expect(info.alive[0]).to.eq(false);
+  });
+
+  it("stall: if nobody acts, the forced night kills nobody", async function () {
+    const id = await startGame();
+    const roles = await allRoles(id);
+    await night(id, 0, 0, roles, { skip: [0, 1, 2, 3, 4], force: true });
+    const info = await game.gameInfo(id);
+    expect(Number(info.lastDeadSeat)).to.eq(NOBODY);
+    expect(Number(info.phase)).to.eq(Phase.Day);
+  });
+
+  it("stall: missing voters abstain and the votes that arrived still count", async function () {
+    const id = await startGame();
+    const roles = await allRoles(id);
+    const k = pick(roles, KILLER);
+    const v1 = pick(roles, VILLAGER);
+    const v2 = pick(roles, VILLAGER, [v1]);
+    const v3 = pick(roles, VILLAGER, [v1, v2]);
+
+    await night(id, v1, v1, roles); // the Doctor saves v1: nobody dies
+    await vote(id, { [v2]: v1, [v3]: v1 }, true); // only two of five vote, then the timeout passes
+    const info = await game.gameInfo(id);
+    expect(Number(info.lastDeadSeat)).to.eq(v1);
+    expect(info.alive[v1]).to.eq(false);
+    expect(info.alive[k]).to.eq(true);
+  });
+
+  it("stall: forceResolve is refused too early, in the lobby and after resolution", async function () {
+    await (await game.connect(players[0]).createGame()).wait();
+    const lobbyId = Number(await game.gameCount());
+    await expect(game.forceResolve(lobbyId)).to.be.revertedWith("Nothing to force");
+
+    const id = await startGame();
+    await expect(game.forceResolve(id)).to.be.revertedWith("Too early");
+    await ethers.provider.send("evm_increaseTime", [10 * 60 + 5]);
+    await ethers.provider.send("evm_mine", []);
+    await (await game.forceResolve(id)).wait();
+    await expect(game.forceResolve(id)).to.be.revertedWith("Nothing to force");
+  });
+
+  it("actionStatus shows who has acted and the deadline", async function () {
+    const id = await startGame();
+    const roles = await allRoles(id);
+    let st = await game.actionStatus(id);
+    expect(Number(st.acted)).to.eq(0);
+    const enc = await fhevm.createEncryptedInput(gameAddress, players[2].address).add8(1).encrypt();
+    await (await game.connect(players[2]).submitNightAction(id, enc.handles[0], enc.inputProof)).wait();
+    st = await game.actionStatus(id);
+    expect(Number(st.acted)).to.eq(1);
+    expect(st.hasActed[2]).to.eq(true);
+    expect(st.hasActed[0]).to.eq(false);
+    expect(Number(st.deadline)).to.be.greaterThan(0);
+    void roles;
   });
 
   it("rejects wrong-phase actions, double actions, outsiders and early reveals", async function () {

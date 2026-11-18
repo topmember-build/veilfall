@@ -16,9 +16,13 @@ import {ZamaEthereumConfig} from "@fhevm/solidity/config/ZamaConfig.sol";
 /// @dev Role codes: 0 = Villager, 1 = Killer, 2 = Doctor. 255 = nobody.
 ///      Win rules: Killer eliminated -> Villagers win. Two or fewer alive with the Killer
 ///      still alive -> Killer wins. A tied vote eliminates nobody.
+///      Stall protection: if a living player does not act within PHASE_TIMEOUT, anyone can call
+///      forceResolve and the phase resolves without them (a missing Killer means no kill, a
+///      missing Doctor means no save, a missing voter simply abstains).
 contract Veilfall is ZamaEthereumConfig {
     uint8 public constant SEATS = 5;
     uint8 public constant NOBODY = 255;
+    uint48 public constant PHASE_TIMEOUT = 10 minutes;
 
     enum Phase {
         Lobby,
@@ -42,14 +46,16 @@ contract Veilfall is ZamaEthereumConfig {
         uint8 acted;
         uint8 round;
         bool killerDead;
-        bool doctorDead;
         uint8 lastDeadSeat;
+        uint48 phaseStartedAt;
         address[5] players;
         bool[5] alive;
         bool[5] hasActed;
         euint8[5] roles;
         euint8 nightKill;
         euint8 nightSave;
+        ebool killerActed;
+        ebool doctorActed;
         euint8[5] tally;
         euint8 pendingSeat;
         euint8 pendingRole;
@@ -67,6 +73,7 @@ contract Veilfall is ZamaEthereumConfig {
     event PlayerDied(uint256 indexed id, uint8 seat, uint8 role, bool byVote);
     event NobodyDied(uint256 indexed id, bool byVote);
     event GameEnded(uint256 indexed id, Winner winner);
+    event PhaseForced(uint256 indexed id, Phase phase);
 
     // ------------------------------------------------------------------ lobby
 
@@ -112,10 +119,18 @@ contract Veilfall is ZamaEthereumConfig {
         euint8 role = g.roles[seat];
 
         // Accumulate on the fly: only the Killer's and Doctor's targets get through.
-        g.nightKill = FHE.add(g.nightKill, FHE.select(FHE.eq(role, uint8(1)), t, zero));
-        g.nightSave = FHE.add(g.nightSave, FHE.select(FHE.eq(role, uint8(2)), t, zero));
+        // We also remember (encrypted) whether the Killer / Doctor have acted at all, so a
+        // stalled Killer or Doctor cannot leave a default target of seat 0 behind.
+        ebool isKiller = FHE.eq(role, uint8(1));
+        ebool isDoctor = FHE.eq(role, uint8(2));
+        g.nightKill = FHE.add(g.nightKill, FHE.select(isKiller, t, zero));
+        g.nightSave = FHE.add(g.nightSave, FHE.select(isDoctor, t, zero));
+        g.killerActed = FHE.or(g.killerActed, isKiller);
+        g.doctorActed = FHE.or(g.doctorActed, isDoctor);
         FHE.allowThis(g.nightKill);
         FHE.allowThis(g.nightSave);
+        FHE.allowThis(g.killerActed);
+        FHE.allowThis(g.doctorActed);
 
         g.hasActed[seat] = true;
         g.acted++;
@@ -177,6 +192,23 @@ contract Veilfall is ZamaEthereumConfig {
         }
     }
 
+    // ------------------------------------------------------------- stall guard
+
+    /// @notice If living players have not all acted after PHASE_TIMEOUT, resolve the phase
+    ///         with the actions that did arrive. Anyone may call this.
+    function forceResolve(uint256 id) external {
+        Game storage g = _games[id];
+        require(g.phase == Phase.Night || g.phase == Phase.Day, "Nothing to force");
+        require(block.timestamp >= uint256(g.phaseStartedAt) + PHASE_TIMEOUT, "Too early");
+
+        emit PhaseForced(id, g.phase);
+        if (g.phase == Phase.Night) {
+            _resolveNight(id, g);
+        } else {
+            _resolveDay(id, g);
+        }
+    }
+
     // ------------------------------------------------------------------ views
 
     /// @notice Encrypted role handle for a player. Only that player can decrypt it
@@ -184,6 +216,12 @@ contract Veilfall is ZamaEthereumConfig {
     function roleOf(uint256 id, address player) external view returns (euint8) {
         Game storage g = _games[id];
         return g.roles[_seatOfPlayer(g, player)];
+    }
+
+    /// @notice Who has acted in the current Night/Day phase, and when the phase can be forced.
+    function actionStatus(uint256 id) external view returns (uint8 acted, bool[5] memory hasActed, uint256 deadline) {
+        Game storage g = _games[id];
+        return (g.acted, g.hasActed, uint256(g.phaseStartedAt) + PHASE_TIMEOUT);
     }
 
     /// @notice The two handles to publicly decrypt for the current reveal.
@@ -237,16 +275,22 @@ contract Veilfall is ZamaEthereumConfig {
 
     function _startNight(Game storage g) private {
         g.phase = Phase.Night;
+        g.phaseStartedAt = uint48(block.timestamp);
         g.acted = 0;
         for (uint8 i = 0; i < SEATS; i++) g.hasActed[i] = false;
         g.nightKill = FHE.asEuint8(0);
         g.nightSave = FHE.asEuint8(0);
+        g.killerActed = FHE.asEbool(false);
+        g.doctorActed = FHE.asEbool(false);
         FHE.allowThis(g.nightKill);
         FHE.allowThis(g.nightSave);
+        FHE.allowThis(g.killerActed);
+        FHE.allowThis(g.doctorActed);
     }
 
     function _startDay(Game storage g) private {
         g.phase = Phase.Day;
+        g.phaseStartedAt = uint48(block.timestamp);
         g.acted = 0;
         for (uint8 i = 0; i < SEATS; i++) {
             g.hasActed[i] = false;
@@ -262,9 +306,10 @@ contract Veilfall is ZamaEthereumConfig {
             if (!g.alive[j]) continue;
             valid = FHE.or(valid, FHE.eq(g.nightKill, j));
         }
-        // With a dead Doctor nobody can be saved (otherwise a default save of seat 0 would leak in).
-        ebool saved = g.doctorDead ? FHE.asEbool(false) : FHE.eq(g.nightKill, g.nightSave);
-        ebool dies = FHE.and(valid, FHE.not(saved));
+        // A save only counts if a living Doctor really acted (a dead or stalled Doctor leaves the
+        // default target 0 behind), and a kill only counts if the Killer really acted.
+        ebool saved = FHE.and(g.doctorActed, FHE.eq(g.nightKill, g.nightSave));
+        ebool dies = FHE.and(FHE.and(valid, g.killerActed), FHE.not(saved));
 
         euint8 seat = FHE.select(dies, g.nightKill, FHE.asEuint8(NOBODY));
         _publishResult(id, g, seat, Phase.NightReveal);
@@ -327,7 +372,6 @@ contract Veilfall is ZamaEthereumConfig {
         }
         g.alive[seat] = false;
         if (role == 1) g.killerDead = true;
-        if (role == 2) g.doctorDead = true;
         emit PlayerDied(id, seat, role, byVote);
     }
 
