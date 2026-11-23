@@ -109,14 +109,44 @@ export class SoloBots {
     this.note("");
   }
 
-  /** All four bots take a seat. The fifth join deals the roles. */
+  /**
+   * All four bots take a seat. The fifth join deals the roles.
+   * Safe to call again: bots that are already seated are skipped. The public node the bots read from can
+   * lag a few seconds behind the player's wallet, so each step waits and retries instead of giving up.
+   */
   async joinAll(id: number): Promise<void> {
     this.load(true);
     this.note("Your four opponents are taking their seats…");
+
+    // 1. Wait until the bots' node can see the new game.
+    for (let k = 0; k < 40; k++) {
+      try {
+        const info = await this.view.gameInfo(id);
+        if (Number(info.joined) > 0) break;
+      } catch {
+        /* not visible yet */
+      }
+      await sleep(2000);
+    }
+
+    // 2. Each bot joins, retrying on a stale read or a busy node.
     await Promise.all(
       this.contracts.map(async (c, i) => {
-        await sleep(i * 700);
-        await sendTx(c, "join", [id]);
+        await sleep(i * 800);
+        let last: unknown;
+        for (let attempt = 0; attempt < 8; attempt++) {
+          try {
+            const info = await this.view.gameInfo(id);
+            const seated = [...info.players].some((p: string) => p.toLowerCase() === this.wallets[i].address.toLowerCase());
+            if (seated) return;
+            await sendTx(c, "join", [id]);
+            return;
+          } catch (e) {
+            last = e;
+            await sleep(3000 + attempt * 1000);
+          }
+        }
+        throw last;
       }),
     );
     this.note("");

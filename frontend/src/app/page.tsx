@@ -28,6 +28,9 @@ export default function Home() {
   const [copied, setCopied] = useState(false);
   const [solo, setSolo] = useState(false);
   const [botNote, setBotNote] = useState("");
+  const [seating, setSeating] = useState(false);
+  const [seatError, setSeatError] = useState("");
+  const [soloId, setSoloId] = useState<number | null>(null);
   const lantern = useRef<HTMLDivElement>(null);
   const botsRef = useRef<SoloBots | null>(null);
   const lastPointer = useRef(0);
@@ -138,6 +141,23 @@ export default function Home() {
     };
   }, [client, gameId]);
 
+  // Seats the four opponents (safe to repeat) and then starts them playing.
+  const seatBots = async (id: number) => {
+    const bots = botsRef.current;
+    if (!bots) return;
+    setSoloId(id);
+    setSeating(true);
+    setSeatError("");
+    try {
+      await bots.joinAll(id);
+      setSolo(await bots.attach(id));
+    } catch (e) {
+      setSeatError(friendlyError(e));
+    } finally {
+      setSeating(false);
+    }
+  };
+
   const startSolo = async () => {
     let c = client as ChainClient | null;
     const fresh = !c || c.mode !== "chain";
@@ -151,12 +171,16 @@ export default function Home() {
         await chain.connect();
         setClient(chain);
       }
-      const bots = new SoloBots(chain, setStatus);
+      const bots = new SoloBots(chain, (m) => {
+        setStatus(m);
+        setBotNote(m);
+      });
       botsRef.current = bots;
       await bots.ensureFunded();
       const id = await chain.createGame();
-      await bots.joinAll(id);
+      // Open the table straight away; the opponents sit down in the background.
       open(id);
+      void seatBots(id);
     } catch (e) {
       setError(friendlyError(e));
     } finally {
@@ -305,6 +329,22 @@ export default function Home() {
 
       {inLobby && (
         <Hub client={client as ChainClient} busy={busy} onOpen={open} onCreate={() => guarded(async () => open(await (client as ChainClient).createGame()))} onSolo={startSolo} />
+      )}
+
+      {(seating || seatError) && gameId !== null && gameId === soloId && (
+        <div className={`banner ${seatError ? "err" : ""}`} role="status">
+          {seating && <span className="spinner" aria-hidden="true" />}
+          <span>
+            {seating
+              ? `Seating your opponents. This can take up to a minute. ${botNote}`
+              : `The opponents could not all sit down: ${seatError}`}
+          </span>
+          {!seating && (
+            <button className="btn small" onClick={() => seatBots(gameId)}>
+              Try again
+            </button>
+          )}
+        </div>
       )}
 
       {solo && (
