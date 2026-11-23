@@ -70,6 +70,13 @@ export class ChainClient implements GameClient {
   private fhePromise: Promise<any> | null = null;
   private status: (m: string) => void = () => {};
 
+  /** The wallet the player picked; falls back to whatever the browser injects. */
+  constructor(private chosen: any = null) {}
+
+  private get eth(): any {
+    return this.chosen ?? window.ethereum ?? window.okxwallet;
+  }
+
   setStatusListener(fn: (message: string) => void) {
     this.status = fn;
   }
@@ -77,33 +84,34 @@ export class ChainClient implements GameClient {
   // ------------------------------------------------------------ wallet
 
   async connect(): Promise<string> {
-    if (!window.ethereum) {
-      throw new Error("No wallet found. Install MetaMask (or another browser wallet) and refresh.");
+    const eth = this.eth;
+    if (!eth) {
+      throw new Error("No wallet found. Install MetaMask or OKX Wallet, make sure it is enabled for this site, and refresh.");
     }
     this.status("Connecting your wallet…");
-    await window.ethereum.request({ method: "eth_requestAccounts" });
+    await eth.request({ method: "eth_requestAccounts" });
     await this.ensureSepolia();
 
-    this.provider = new BrowserProvider(window.ethereum);
+    this.provider = new BrowserProvider(eth);
     this.signer = await this.provider.getSigner();
     this.address = getAddress(await this.signer.getAddress());
     this.contract = new Contract(CONTRACT_ADDRESS, VEILFALL_ABI, this.signer);
 
     // Any account or network change: simplest and safest is to start fresh.
-    window.ethereum.on?.("accountsChanged", () => window.location.reload());
-    window.ethereum.on?.("chainChanged", () => window.location.reload());
+    eth.on?.("accountsChanged", () => window.location.reload());
+    eth.on?.("chainChanged", () => window.location.reload());
     return this.address;
   }
 
   private async ensureSepolia() {
-    const current = await window.ethereum.request({ method: "eth_chainId" });
+    const current = await this.eth.request({ method: "eth_chainId" });
     if (parseInt(current, 16) === CHAIN_ID) return;
     this.status("Switching your wallet to Sepolia…");
     try {
-      await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: CHAIN_ID_HEX }] });
+      await this.eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: CHAIN_ID_HEX }] });
     } catch (e: any) {
       if (e?.code === 4902) {
-        await window.ethereum.request({
+        await this.eth.request({
           method: "wallet_addEthereumChain",
           params: [
             {
@@ -149,7 +157,7 @@ export class ChainClient implements GameClient {
         this.status("Loading Zama's encryption engine (a few seconds the first time)…");
         const sdk = await loadSdkScript();
         await sdk.initSDK();
-        return sdk.createInstance({ ...sdk.SepoliaConfig, network: window.ethereum });
+        return sdk.createInstance({ ...sdk.SepoliaConfig, network: this.eth });
       })().catch((e) => {
         this.fhePromise = null;
         throw e;

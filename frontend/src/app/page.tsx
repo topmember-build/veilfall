@@ -10,6 +10,7 @@ import { GameClient } from "@/lib/types";
 import { GameView } from "@/components/GameView";
 import { Hub } from "@/components/Hub";
 import { RulesModal } from "@/components/RulesModal";
+import { discoverWallets, WalletOption } from "@/lib/wallets";
 
 const gameFromUrl = (): number | null => {
   const g = Number(new URLSearchParams(window.location.search).get("game"));
@@ -28,6 +29,7 @@ export default function Home() {
   const [copied, setCopied] = useState(false);
   const [solo, setSolo] = useState(false);
   const [botNote, setBotNote] = useState("");
+  const [picker, setPicker] = useState<{ wallets: WalletOption[]; resolve: (p: unknown) => void; reject: (e: Error) => void } | null>(null);
   const [seating, setSeating] = useState(false);
   const [seatError, setSeatError] = useState("");
   const [soloId, setSoloId] = useState<number | null>(null);
@@ -158,16 +160,37 @@ export default function Home() {
     }
   };
 
-  const startSolo = async () => {
-    let c = client as ChainClient | null;
-    const fresh = !c || c.mode !== "chain";
-    if (fresh) c = new ChainClient();
-    const chain = c as ChainClient;
+  // Finds the wallets in this browser; asks which one to use when there is more than one.
+  const chooseWallet = async (): Promise<unknown> => {
+    const wallets = await discoverWallets();
+    if (wallets.length === 0) {
+      throw new Error(
+        "No wallet found. Install MetaMask or OKX Wallet, make sure it is enabled for this site (and for private windows if you use one), then refresh.",
+      );
+    }
+    if (wallets.length === 1) return wallets[0].provider;
+    return new Promise((resolve, reject) => setPicker({ wallets, resolve, reject }));
+  };
+
+  const connectChain = async () => {
     setBusy(true);
     setError("");
-    chain.setStatusListener(setStatus);
     try {
-      if (fresh) {
+      await start(new ChainClient(await chooseWallet()), false);
+    } catch (e) {
+      setError(friendlyError(e));
+      setBusy(false);
+    }
+  };
+
+  const startSolo = async () => {
+    const existing = client?.mode === "chain" ? (client as ChainClient) : null;
+    setBusy(true);
+    setError("");
+    try {
+      const chain: ChainClient = existing ?? new ChainClient(await chooseWallet());
+      chain.setStatusListener(setStatus);
+      if (!existing) {
         await chain.connect();
         setClient(chain);
       }
@@ -297,7 +320,7 @@ export default function Home() {
               <button className="btn primary" disabled={busy} onClick={startSolo}>
                 Play solo against 4 bots
               </button>
-              <button className="btn" disabled={busy} onClick={() => start(new ChainClient(), false)}>
+              <button className="btn" disabled={busy} onClick={connectChain}>
                 {invite ? `Join game #${invite}` : "Open the lobby"}
               </button>
               <button className="btn ghost" disabled={busy} onClick={() => start(new MockClient(), true)}>
@@ -305,7 +328,7 @@ export default function Home() {
               </button>
             </div>
             <p className="note">
-              Both real modes need a browser wallet with a little Sepolia ETH. Solo mode asks for one transfer to fund your
+              Both real modes need a browser wallet (MetaMask, OKX Wallet or similar) with a little Sepolia ETH. Solo mode asks for one transfer to fund your
               opponents. The demo needs nothing and is not on-chain.
             </p>
           </section>
@@ -368,6 +391,51 @@ export default function Home() {
       )}
 
       <RulesModal open={rules} onClose={() => setRules(false)} />
+
+      {picker && (
+        <div
+          className="modal-back"
+          onClick={() => {
+            picker.reject(new Error("Wallet selection cancelled."));
+            setPicker(null);
+          }}
+        >
+          <div className="modal card" role="dialog" aria-modal="true" aria-label="Choose a wallet" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h2>Choose a wallet</h2>
+              <button
+                className="btn small"
+                onClick={() => {
+                  picker.reject(new Error("Wallet selection cancelled."));
+                  setPicker(null);
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+            <p className="hint">More than one wallet is installed in this browser. Pick the one that holds your Sepolia ETH.</p>
+            <ul className="glist">
+              {picker.wallets.map((w) => (
+                <li key={w.id} className="grow">
+                  {w.icon ? <img className="wicon" src={w.icon} alt="" /> : <span className="wicon" aria-hidden="true" />}
+                  <div className="gmain">
+                    <b>{w.name}</b>
+                  </div>
+                  <button
+                    className="btn small primary"
+                    onClick={() => {
+                      picker.resolve(w.provider);
+                      setPicker(null);
+                    }}
+                  >
+                    Connect
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
 
       <footer className="footer">
         Built on the{" "}

@@ -420,3 +420,5 @@ button.pill:hover { color: var(--text); border-color: var(--text); }
   .gmain { flex-basis: 100%; }
   .hub h2 { font-size: 32px; }
 }
+
+.wicon { width: 30px; height: 30px; border-radius: 7px; flex: none; background: var(--panel); }
